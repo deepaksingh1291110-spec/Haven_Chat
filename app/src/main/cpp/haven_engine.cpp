@@ -118,6 +118,31 @@ static double seconds_since(const std::chrono::steady_clock::time_point & t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
+// Gemma writes its thinking between two marker words:
+//   <|channel>thought ... thinking text ... <channel|> final answer
+// Only the final answer goes into the chat memory. If the model was stopped
+// while it was still thinking, there is no answer yet and "" is returned.
+static std::string final_answer_only(const std::string & raw) {
+    static const std::string k_start = "<|channel>";
+    static const std::string k_end   = "<channel|>";
+
+    std::string out;
+    const size_t end = raw.rfind(k_end);
+    if (end != std::string::npos) {
+        out = raw.substr(end + k_end.size());
+    } else if (raw.find(k_start) != std::string::npos) {
+        return "";
+    } else {
+        out = raw;
+    }
+
+    const char * ws = " \t\r\n";
+    const size_t first = out.find_first_not_of(ws);
+    if (first == std::string::npos) { return ""; }
+    const size_t last = out.find_last_not_of(ws);
+    return out.substr(first, last - first + 1);
+}
+
 static void reset_kv() {
     if (g_ctx) { llama_memory_clear(llama_get_memory(g_ctx), true); }
     g_cached.clear();
@@ -378,11 +403,12 @@ Java_com_haven_chat_LlamaBridge_generate(JNIEnv * env, jobject, jbyteArray jtext
     const double gen_s = seconds_since(t_gen);
     const bool stopped = g_stop.load();
 
-    // 6) Remember the answer in the conversation.
-    if (!answer.empty()) {
+    // 6) Remember only the final answer (not the thinking) in the conversation.
+    const std::string kept = final_answer_only(answer);
+    if (!kept.empty()) {
         common_chat_msg a;
         a.role    = "assistant";
-        a.content = answer;
+        a.content = kept;
         g_msgs.push_back(a);
     } else {
         g_msgs.resize(msgs_before);

@@ -2,12 +2,17 @@ package com.haven.chat
 
 import android.app.Activity
 import android.content.Intent
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
 import android.text.InputType
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.text.style.RelativeSizeSpan
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -47,6 +52,7 @@ class MainActivity : Activity() {
     private lateinit var threadsSpinner: Spinner
     private lateinit var ctxSpinner: Spinner
     private lateinit var thinkingBox: CheckBox
+    private lateinit var showThinkBox: CheckBox
     private lateinit var systemEdit: EditText
     private lateinit var loadBtn: Button
     private lateinit var newChatBtn: Button
@@ -58,6 +64,13 @@ class MainActivity : Activity() {
     private lateinit var stopBtn: Button
 
     private val ctxChoices = listOf(2048, 4096, 8192)
+
+    // Colors for the chat text
+    private val answerColor = Color.parseColor("#1F1F1F")
+    private val thinkingColor = Color.parseColor("#8A8A8A")
+
+    // Splits Gemma's stream into thinking and answer (UI thread only)
+    private var splitter: ThinkingSplitter? = null
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -175,9 +188,15 @@ class MainActivity : Activity() {
         panel.addView(choiceRow)
 
         thinkingBox = CheckBox(this)
-        thinkingBox.text = "Thinking on (shows raw thinking text)"
+        thinkingBox.text = "Let Gemma think first (slower)"
         thinkingBox.textSize = 13f
         panel.addView(thinkingBox)
+
+        showThinkBox = CheckBox(this)
+        showThinkBox.text = "Show the thinking text in the chat"
+        showThinkBox.textSize = 13f
+        showThinkBox.isChecked = true
+        panel.addView(showThinkBox)
 
         panel.addView(label("System prompt (used on Load and New chat)"))
         systemEdit = EditText(this)
@@ -210,6 +229,7 @@ class MainActivity : Activity() {
         scroll = ScrollView(this)
         outputText = TextView(this)
         outputText.textSize = 15f
+        outputText.setTextColor(answerColor)
         outputText.setPadding(dp(4), dp(8), dp(4), dp(8))
         outputText.setTextIsSelectable(true)
         outputText.text = "Load the model, then type a message below."
@@ -295,6 +315,32 @@ class MainActivity : Activity() {
     private fun appendOutput(s: String) {
         outputText.append(s)
         scroll.post { scroll.scrollTo(0, outputText.height) }
+    }
+
+    private fun appendStyled(s: String, color: Int, size: Float) {
+        val styled = SpannableString(s)
+        styled.setSpan(ForegroundColorSpan(color), 0, styled.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        styled.setSpan(RelativeSizeSpan(size), 0, styled.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        outputText.append(styled)
+        scroll.post { scroll.scrollTo(0, outputText.height) }
+    }
+
+    /** Thinking goes in small grey text, the answer in normal text. */
+    private fun newSplitter(showThinking: Boolean): ThinkingSplitter {
+        return ThinkingSplitter(
+            onThinkingStart = {
+                if (showThinking) {
+                    appendStyled("Thinking:\n", thinkingColor, 0.85f)
+                } else {
+                    appendStyled("Thinking...", thinkingColor, 0.85f)
+                }
+            },
+            onThinking = { text ->
+                if (showThinking) appendStyled(text, thinkingColor, 0.85f)
+            },
+            onThinkingEnd = { appendOutput("\n\n") },
+            onAnswer = { text -> appendOutput(text) }
+        )
     }
 
     private fun toast(msg: String) {
@@ -405,6 +451,8 @@ class MainActivity : Activity() {
         if (text.isEmpty()) return
         inputEdit.setText("")
         val thinking = thinkingBox.isChecked
+        val split = newSplitter(showThinkBox.isChecked)
+        splitter = split
 
         appendOutput("\n\nYou: $text\n\nGemma: ")
         setBusy(true)
@@ -413,7 +461,7 @@ class MainActivity : Activity() {
         val listener = object : TokenListener {
             override fun onToken(bytes: ByteArray): Boolean {
                 val piece = String(bytes, Charsets.UTF_8)
-                runOnUiThread { appendOutput(piece) }
+                runOnUiThread { split.feed(piece) }
                 return true
             }
         }
@@ -430,11 +478,121 @@ class MainActivity : Activity() {
             }
             val log = if (stats.startsWith("ERROR") && b != null) b.lastLog() else ""
             runOnUiThread {
-                appendOutput("\n\n[" + stats + "]")
-                if (log.isNotEmpty()) appendOutput("\n" + log.takeLast(300))
+                split.finish()
+                if (split.inThinking) {
+                    appendStyled("\n\n(No answer yet: it was stopped or ran out of tokens while thinking.)",
+                        thinkingColor, 0.85f)
+                }
+                appendStyled("\n\n[" + stats + "]", thinkingColor, 0.8f)
+                if (log.isNotEmpty()) appendStyled("\n" + log.takeLast(300), thinkingColor, 0.8f)
                 statusText.text = "Ready"
                 setBusy(false)
             }
+        }
+    }
+}
+
+/**
+ * Splits Gemma's text stream into thinking and answer.
+ * Gemma writes:  <|channel>thought ... thinking ... <channel|> answer
+ * The marker words are never shown. Pure Kotlin (no Android), so it can be tested alone.
+ */
+class ThinkingSplitter(
+    private val onThinkingStart: () -> Unit,
+    private val onThinking: (String) -> Unit,
+    private val onThinkingEnd: () -> Unit,
+    private val onAnswer: (String) -> Unit
+) {
+    private val startMarker = "<|channel>"
+    private val endMarker = "<channel|>"
+    private val label = "thought"
+
+    private var buf = StringBuilder()
+    private var labelPending = false
+    private var answerStarted = false
+
+    /** True while the model is inside its thinking part. */
+    var inThinking = false
+        private set
+
+    fun feed(piece: String) {
+        buf.append(piece)
+        drain(false)
+    }
+
+    /** Call once when the stream is over: sends out any text that was held back. */
+    fun finish() {
+        drain(true)
+    }
+
+    // How many characters at the end of text could be the beginning of marker.
+    private fun partialLen(text: String, marker: String): Int {
+        var k = minOf(text.length, marker.length - 1)
+        while (k > 0) {
+            if (text.endsWith(marker.substring(0, k))) return k
+            k--
+        }
+        return 0
+    }
+
+    private fun emitAnswer(text: String) {
+        var t = text
+        if (!answerStarted) {
+            t = t.trimStart()
+            if (t.isEmpty()) return
+            answerStarted = true
+        }
+        onAnswer(t)
+    }
+
+    private fun drain(finishing: Boolean) {
+        while (true) {
+            val text = buf.toString()
+
+            if (!inThinking) {
+                val i = text.indexOf(startMarker)
+                if (i >= 0) {
+                    if (i > 0) emitAnswer(text.substring(0, i))
+                    buf = StringBuilder(text.substring(i + startMarker.length))
+                    inThinking = true
+                    labelPending = true
+                    onThinkingStart()
+                    continue
+                }
+                val hold = if (finishing) 0 else partialLen(text, startMarker)
+                val n = text.length - hold
+                if (n > 0) emitAnswer(text.substring(0, n))
+                buf = StringBuilder(text.substring(n))
+                return
+            }
+
+            if (labelPending) {
+                // Right after the start marker Gemma writes the word "thought": hide it.
+                if (!finishing && text.length <= label.length && label.startsWith(text)) return
+                var rest = text
+                if (rest.startsWith(label)) {
+                    rest = rest.substring(label.length)
+                    if (rest.startsWith("\n")) rest = rest.substring(1)
+                }
+                labelPending = false
+                buf = StringBuilder(rest)
+                continue
+            }
+
+            val j = text.indexOf(endMarker)
+            if (j >= 0) {
+                if (j > 0) onThinking(text.substring(0, j))
+                buf = StringBuilder(text.substring(j + endMarker.length))
+                inThinking = false
+                answerStarted = false
+                onThinkingEnd()
+                continue
+            }
+            val hold = if (finishing) 0 else partialLen(text, endMarker)
+            val n = text.length - hold
+            if (n > 0) onThinking(text.substring(0, n))
+            buf = StringBuilder(text.substring(n))
+            return
         }
     }
 }
