@@ -41,7 +41,33 @@ class LlamaBridge {
     /** Last warnings and errors printed by llama.cpp. */
     external fun lastLog(): String
 
+    // ---------------------------------------------------------------- search models
+    // Only ONE search model is loaded at a time, and only while the main model is
+    // unloaded (RAM). Order: unload() -> loadAux(embedder) -> embed(...) -> unloadAux()
+    //                        -> loadAux(reranker) -> rerankScore(...) -> unloadAux()
+
+    /**
+     * Loads a search model. kind: KIND_EMBEDDER or KIND_RERANKER.
+     * Returns 0 = ok, 1 = model file failed to load, 2 = context failed to create,
+     * 3 = unknown kind, 4 = the main model is still loaded (call unload() first).
+     */
+    external fun loadAux(path: String, kind: Int, nThreads: Int): Int
+
+    /** One line of facts about the loaded search model (vector size, pooling type). */
+    external fun auxInfo(): String
+
+    /** Embeds one text (UTF-8 bytes). Returns a normalized vector, or null on error. */
+    external fun embed(text: ByteArray): FloatArray?
+
+    /** Relevance score of a document for a query (UTF-8 bytes). Higher = better. -1e6 = error. */
+    external fun rerankScore(query: ByteArray, doc: ByteArray): Float
+
+    external fun unloadAux()
+
     companion object {
+        const val KIND_EMBEDDER = 1
+        const val KIND_RERANKER = 2
+
         init {
             System.loadLibrary("haven-engine")
         }

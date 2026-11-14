@@ -1,7 +1,8 @@
 // haven_engine.cpp - llama.cpp engine for Haven Chat (CPU only).
 //
-// Phase 2a: load one GGUF model, chat with it (streaming), choose CPU threads.
-// Embedding and reranking are added in phases 2b and 2c.
+// Main model (Gemma): load one GGUF model, chat with it (streaming), choose CPU threads.
+// Search models (phases 2b and 2c): bge-m3 embeddings and the reranker, loaded one at a
+// time and only while the main model is unloaded (RAM).
 //
 // All functions are called from ONE background thread in Kotlin, except
 // stop(), which only sets a flag.
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <exception>
 #include <mutex>
@@ -177,6 +179,112 @@ static int decode_chunked(const std::vector<llama_token> & tokens, size_t from) 
         i += n;
     }
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Search models: bge-m3 embedder (kind 1) and reranker (kind 2)
+// ---------------------------------------------------------------------------
+static llama_model *   g_aux_model = nullptr;
+static llama_context * g_aux_ctx   = nullptr;
+static int             g_aux_kind  = 0;   // 1 = embedder, 2 = reranker
+static int             g_aux_n_ctx = 0;
+
+static void free_aux() {
+    if (g_aux_ctx)   { llama_free(g_aux_ctx); g_aux_ctx = nullptr; }
+    if (g_aux_model) { llama_model_free(g_aux_model); g_aux_model = nullptr; }
+    g_aux_kind  = 0;
+    g_aux_n_ctx = 0;
+}
+
+// Runs the search model over one token sequence (all tokens in sequence 0).
+// Returns the pooled result of sequence 0 (embedding vector, or the rank score),
+// or nullptr on error.
+static const float * aux_run(const std::vector<llama_token> & tokens) {
+    if (!g_aux_ctx || tokens.empty()) { return nullptr; }
+
+    llama_memory_t mem = llama_get_memory(g_aux_ctx);
+    if (mem) { llama_memory_clear(mem, true); }
+
+    const int32_t n = (int32_t) tokens.size();
+    llama_batch batch = llama_batch_init(n, 0, 1);
+    for (int32_t i = 0; i < n; i++) {
+        batch.token[i]     = tokens[i];
+        batch.pos[i]       = i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = true;
+    }
+    batch.n_tokens = n;
+    const int rc = llama_decode(g_aux_ctx, batch);
+    llama_batch_free(batch);
+    if (rc != 0) {
+        LOGE("search model decode failed: %d (%d tokens)", rc, (int) n);
+        return nullptr;
+    }
+    return llama_get_embeddings_seq(g_aux_ctx, 0);
+}
+
+static std::vector<llama_token> embed_tokens(const std::string & text) {
+    const llama_vocab * vocab = llama_model_get_vocab(g_aux_model);
+    std::vector<llama_token> t = common_tokenize(vocab, text, /*add_special*/ true, /*parse_special*/ false);
+    if ((int) t.size() > g_aux_n_ctx && g_aux_n_ctx > 1) {
+        const llama_token last = t.back();     // keep the closing token
+        t.resize((size_t) g_aux_n_ctx);
+        t.back() = last;
+    }
+    return t;
+}
+
+// Same token layout as llama-server uses for reranking:
+//   [BOS] query [EOS] [SEP] document [EOS]   (or the model's own "rerank" template)
+static std::vector<llama_token> rerank_tokens(const std::string & query, const std::string & doc) {
+    const llama_vocab * vocab = llama_model_get_vocab(g_aux_model);
+    std::vector<llama_token> out;
+
+    const char * tmpl = llama_model_chat_template(g_aux_model, "rerank");
+    if (tmpl != nullptr) {
+        const std::string t = tmpl;
+        std::string prompt;
+        for (size_t pos = 0; pos < t.size();) {
+            if (t.compare(pos, 7, "{query}") == 0) {
+                prompt += query;
+                pos += 7;
+            } else if (t.compare(pos, 10, "{document}") == 0) {
+                prompt += doc;
+                pos += 10;
+            } else {
+                prompt += t[pos++];
+            }
+        }
+        out = common_tokenize(vocab, prompt, /*add_special*/ false, /*parse_special*/ true);
+        if ((int) out.size() > g_aux_n_ctx) { out.resize((size_t) g_aux_n_ctx); }
+        return out;
+    }
+
+    std::vector<llama_token> q = common_tokenize(vocab, query, false, false);
+    std::vector<llama_token> d = common_tokenize(vocab, doc,   false, false);
+
+    llama_token eos = llama_vocab_eos(vocab);
+    if (eos == LLAMA_TOKEN_NULL) { eos = llama_vocab_sep(vocab); }
+    const bool add_bos = llama_vocab_get_add_bos(vocab);
+    const bool add_eos = llama_vocab_get_add_eos(vocab);
+    const bool add_sep = llama_vocab_get_add_sep(vocab);
+
+    // Make everything fit into the context: shorten the document first, then the query.
+    const size_t extra = (add_bos ? 1 : 0) + (add_eos ? 2 : 0) + (add_sep ? 1 : 0);
+    const size_t room  = (size_t) g_aux_n_ctx > extra + 2 ? (size_t) g_aux_n_ctx - extra : 2;
+    if (q.size() + d.size() > room) {
+        if (q.size() > room / 2) { q.resize(std::max<size_t>(1, room / 2)); }
+        d.resize(room - q.size());
+    }
+
+    if (add_bos) { out.push_back(llama_vocab_bos(vocab)); }
+    out.insert(out.end(), q.begin(), q.end());
+    if (add_eos) { out.push_back(eos); }
+    if (add_sep) { out.push_back(llama_vocab_sep(vocab)); }
+    out.insert(out.end(), d.begin(), d.end());
+    if (add_eos) { out.push_back(eos); }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +552,100 @@ JNIEXPORT jstring JNICALL
 Java_com_haven_chat_LlamaBridge_lastLog(JNIEnv * env, jobject) {
     std::lock_guard<std::mutex> lock(g_log_mu);
     return ascii_jstring(env, g_log_buf);
+}
+
+// ---------------------------------------------------------------------------
+// Search models (JNI)
+// ---------------------------------------------------------------------------
+
+// kind: 1 = bge-m3 embedder, 2 = reranker.
+// Returns 0 = ok, 1 = model file failed to load, 2 = context failed to create,
+// 3 = unknown kind, 4 = the main model is still loaded (unload it first: RAM).
+JNIEXPORT jint JNICALL
+Java_com_haven_chat_LlamaBridge_loadAux(JNIEnv * env, jobject, jstring jpath, jint kind, jint n_threads) {
+    if (g_model || g_ctx) { return 4; }
+    if (kind != 1 && kind != 2) { return 3; }
+    free_aux();
+    {
+        std::lock_guard<std::mutex> lock(g_log_mu);
+        g_log_buf.clear();
+    }
+    const std::string path = jstring_to_std(env, jpath);
+    const int threads = std::max(1, std::min(16, (int) n_threads));
+
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = 0;   // CPU only
+    g_aux_model = llama_model_load_from_file(path.c_str(), mparams);
+    if (!g_aux_model) { return 1; }
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx           = 2048;
+    cparams.n_batch         = 2048;   // a whole text must fit into one batch
+    cparams.n_ubatch        = 2048;
+    cparams.n_threads       = threads;
+    cparams.n_threads_batch = threads;
+    cparams.embeddings      = true;
+    if (kind == 2) { cparams.pooling_type = LLAMA_POOLING_TYPE_RANK; }   // like llama-server --reranking
+    g_aux_ctx = llama_init_from_model(g_aux_model, cparams);
+    if (!g_aux_ctx) {
+        llama_model_free(g_aux_model);
+        g_aux_model = nullptr;
+        return 2;
+    }
+    g_aux_kind  = kind;
+    g_aux_n_ctx = (int) llama_n_ctx(g_aux_ctx);
+    LOGI("search model loaded: kind %d, n_ctx %d, threads %d", kind, g_aux_n_ctx, threads);
+    return 0;
+}
+
+// One line of facts about the loaded search model (to check it is the right kind).
+JNIEXPORT jstring JNICALL
+Java_com_haven_chat_LlamaBridge_auxInfo(JNIEnv * env, jobject) {
+    if (!g_aux_model || !g_aux_ctx) { return env->NewStringUTF("no search model loaded"); }
+    char buf[200];
+    snprintf(buf, sizeof(buf), "%s | vector size %d | pooling %d (2 = CLS, 4 = rank) | context %d",
+             g_aux_kind == 1 ? "embedder" : "reranker",
+             (int) llama_model_n_embd_out(g_aux_model),
+             (int) llama_pooling_type(g_aux_ctx),
+             g_aux_n_ctx);
+    return env->NewStringUTF(buf);
+}
+
+// Embeds one text (UTF-8 bytes). Returns a normalized vector, or null on error.
+JNIEXPORT jfloatArray JNICALL
+Java_com_haven_chat_LlamaBridge_embed(JNIEnv * env, jobject, jbyteArray jtext) {
+    if (!g_aux_model || !g_aux_ctx || g_aux_kind != 1) { return nullptr; }
+    const std::vector<llama_token> tokens = embed_tokens(bytes_to_std(env, jtext));
+    const float * e = aux_run(tokens);
+    if (!e) { return nullptr; }
+
+    const int n = (int) llama_model_n_embd_out(g_aux_model);
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) { sum += (double) e[i] * (double) e[i]; }
+    const float norm = sum > 0.0 ? (float) (1.0 / std::sqrt(sum)) : 1.0f;
+
+    std::vector<float> v((size_t) n);
+    for (int i = 0; i < n; i++) { v[(size_t) i] = e[i] * norm; }
+
+    jfloatArray arr = env->NewFloatArray(n);
+    env->SetFloatArrayRegion(arr, 0, n, v.data());
+    return arr;
+}
+
+// Relevance score of one document for one query (both UTF-8 bytes). Higher = more relevant.
+// Returns -1e6 on error.
+JNIEXPORT jfloat JNICALL
+Java_com_haven_chat_LlamaBridge_rerankScore(JNIEnv * env, jobject, jbyteArray jquery, jbyteArray jdoc) {
+    if (!g_aux_model || !g_aux_ctx || g_aux_kind != 2) { return -1e6f; }
+    const std::vector<llama_token> tokens = rerank_tokens(bytes_to_std(env, jquery), bytes_to_std(env, jdoc));
+    const float * r = aux_run(tokens);
+    if (!r) { return -1e6f; }
+    return r[0];
+}
+
+JNIEXPORT void JNICALL
+Java_com_haven_chat_LlamaBridge_unloadAux(JNIEnv *, jobject) {
+    free_aux();
 }
 
 }  // extern "C"
