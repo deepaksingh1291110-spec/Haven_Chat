@@ -5,9 +5,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  # llama.cpp release that this app is built against (change here to upgrade)
+  LLAMA_TAG: b11871
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -16,12 +21,20 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Get llama.cpp (pinned release)
+        run: git clone --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp third_party/llama.cpp
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
 
-      - name: Accept Android SDK licenses
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - name: Install Android NDK and CMake
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDKM=$(ls "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager | head -n 1)
+          echo "Using $SDKM (SDK root: $SDK_ROOT)"
+          yes | "$SDKM" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          "$SDKM" --sdk_root="$SDK_ROOT" "ndk;27.2.12479018" "cmake;3.31.6"
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace

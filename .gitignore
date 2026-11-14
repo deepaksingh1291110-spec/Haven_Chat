@@ -1,7 +1,9 @@
 .gradle/
 build/
+.cxx/
 local.properties
 *.apk
 *.gguf
 *.db
 .idea/
+third_party/
