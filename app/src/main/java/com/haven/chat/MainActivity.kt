@@ -56,6 +56,10 @@ class MainActivity : Activity() {
     private lateinit var systemEdit: EditText
     private lateinit var loadBtn: Button
     private lateinit var newChatBtn: Button
+    private lateinit var embedPathEdit: EditText
+    private lateinit var rerankPathEdit: EditText
+    private lateinit var selfTestBtn: Button
+    private lateinit var panelHolder: ScrollView
     private lateinit var infoText: TextView
     private lateinit var scroll: ScrollView
     private lateinit var outputText: TextView
@@ -219,11 +223,32 @@ class MainActivity : Activity() {
         btnRow.addView(newChatBtn)
         panel.addView(btnRow)
 
+        panel.addView(label("Search models (used by the self-test)"))
+        embedPathEdit = EditText(this)
+        embedPathEdit.setSingleLine(true)
+        embedPathEdit.textSize = 13f
+        embedPathEdit.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        embedPathEdit.setText("/storage/emulated/0/HavenModels/bge-m3-F16.gguf")
+        panel.addView(embedPathEdit)
+        rerankPathEdit = EditText(this)
+        rerankPathEdit.setSingleLine(true)
+        rerankPathEdit.textSize = 13f
+        rerankPathEdit.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        rerankPathEdit.setText("/storage/emulated/0/HavenModels/Bge-M3-568M-F16.gguf")
+        panel.addView(rerankPathEdit)
+        selfTestBtn = Button(this)
+        selfTestBtn.isAllCaps = false
+        selfTestBtn.text = "Search models self-test"
+        panel.addView(selfTestBtn)
+
         infoText = TextView(this)
         infoText.textSize = 11f
         panel.addView(infoText)
 
-        root.addView(panel)
+        panelHolder = ScrollView(this)
+        panelHolder.addView(panel)
+        root.addView(panelHolder, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
         // Output
         scroll = ScrollView(this)
@@ -261,12 +286,13 @@ class MainActivity : Activity() {
 
         // Listeners
         toggleBtn.setOnClickListener {
-            panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            panelHolder.visibility = if (panelHolder.visibility == View.VISIBLE) View.GONE else View.VISIBLE
             updateToggleText()
         }
         permBtn.setOnClickListener { askAllFilesAccess() }
         loadBtn.setOnClickListener { onLoadClicked() }
         newChatBtn.setOnClickListener { onNewChatClicked() }
+        selfTestBtn.setOnClickListener { onSelfTestClicked() }
         sendBtn.setOnClickListener { onSendClicked() }
         stopBtn.setOnClickListener { bridge?.stop() }
 
@@ -301,13 +327,14 @@ class MainActivity : Activity() {
     }
 
     private fun updateToggleText() {
-        toggleBtn.text = if (panel.visibility == View.VISIBLE) "Hide settings" else "Settings"
+        toggleBtn.text = if (panelHolder.visibility == View.VISIBLE) "Hide settings" else "Settings"
     }
 
     private fun setBusy(b: Boolean) {
         busy = b
         loadBtn.isEnabled = !b
         newChatBtn.isEnabled = !b
+        selfTestBtn.isEnabled = !b
         sendBtn.isEnabled = !b
         stopBtn.isEnabled = b
     }
@@ -423,13 +450,228 @@ class MainActivity : Activity() {
                 if (rc == 0) {
                     statusText.text = "Loaded in " + "%.1f".format(secs) + " s | $threads threads | context $ctx"
                     outputText.text = ""
-                    panel.visibility = View.GONE
+                    panelHolder.visibility = View.GONE
                     updateToggleText()
                 } else {
                     statusText.text = "Load failed (code $rc). " + log.takeLast(500)
                 }
                 setBusy(false)
             }
+        }
+    }
+
+    // ------------------------------------------------------------------ search models self-test
+
+    private class TestCase(val query: String, val answer: Int)   // answer = index of the right memory
+
+    private val testMemories = listOf(
+        "I am building an Android app called Haven Chat that runs an AI model on my phone with llama.cpp.",
+        "My 4-bit counter circuit had a timing race. Adding a pull-down resistor on the clear pin of the 74HC161 fixed the clock skew.",
+        "I decided to use SQLite with FTS5 for keyword search and keep all vectors in the same database file.",
+        "My phone is a Realme P3 with 8 GB of RAM, so I can only load one model at a time.",
+        "For lunch on Friday I plan to cook paneer butter masala with garlic naan."
+    )
+
+    private val testCases = listOf(
+        TestCase("How did I fix the glitch in my digital logic project?", 1),
+        TestCase("Which database did I choose for searching old chats?", 2),
+        TestCase("How much memory does my handset have?", 3),
+        TestCase("What am I planning to eat on Friday?", 4),
+        TestCase("What is the name of the mobile application I am developing?", 0)
+    )
+
+    private fun say(line: String) {
+        runOnUiThread { appendStyled(line + "\n", Color.parseColor("#444444"), 0.9f) }
+    }
+
+    private fun secs(t0: Long): String = "%.1f".format((System.nanoTime() - t0) / 1e9)
+
+    private fun dot(a: FloatArray, b: FloatArray): Float {
+        var sum = 0f
+        for (i in a.indices) sum += a[i] * b[i]
+        return sum
+    }
+
+    private fun loadError(what: String, rc: Int, b: LlamaBridge): String {
+        val reason = when (rc) {
+            1 -> "the $what file could not be loaded"
+            2 -> "the $what context could not be created (not enough RAM?)"
+            4 -> "the main model is still loaded"
+            else -> "error code $rc"
+        }
+        return "  FAILED: $reason. " + b.lastLog().takeLast(300)
+    }
+
+    private fun onSelfTestClicked() {
+        if (busy) return
+        if (!engineReady) {
+            toast("The engine is not ready yet")
+            return
+        }
+        if (!hasAllFilesAccess()) {
+            toast("Tap 'Allow file access' first")
+            return
+        }
+        val embPath = embedPathEdit.text.toString().trim()
+        val rerPath = rerankPathEdit.text.toString().trim()
+        if (!File(embPath).isFile) {
+            statusText.text = "File not found: $embPath"
+            return
+        }
+        if (!File(rerPath).isFile) {
+            statusText.text = "File not found: $rerPath"
+            return
+        }
+        val threads = threadsSpinner.selectedItemPosition + 1
+
+        loaded = false          // the main model is unloaded by the test
+        setBusy(true)
+        panelHolder.visibility = View.GONE
+        updateToggleText()
+        statusText.text = "Self-test running..."
+        appendOutput("\n\n")
+        say("=== Search models self-test ===")
+
+        worker.execute {
+            val b = bridge
+            try {
+                if (b == null) {
+                    say("The engine is not available.")
+                } else {
+                    runSelfTest(b, embPath, rerPath, threads)
+                }
+            } catch (t: Throwable) {
+                say("Self-test crashed: " + t.javaClass.simpleName + " " + t.message)
+            }
+            runOnUiThread {
+                statusText.text = "Self-test finished. Press Load model to chat again."
+                setBusy(false)
+            }
+        }
+    }
+
+    // Runs on the worker thread.
+    private fun runSelfTest(b: LlamaBridge, embPath: String, rerPath: String, threads: Int) {
+        val utf8 = Charsets.UTF_8
+
+        say("Step 1: free the main model (RAM)")
+        b.unload()
+
+        // ---- embedder
+        say("Step 2: embedder (bge-m3)")
+        var t0 = System.nanoTime()
+        var rc = b.loadAux(embPath, LlamaBridge.KIND_EMBEDDER, threads)
+        if (rc != 0) {
+            say(loadError("embedder", rc, b))
+            return
+        }
+        say("  loaded in " + secs(t0) + " s | " + b.auxInfo())
+
+        t0 = System.nanoTime()
+        val memVecs = ArrayList<FloatArray>()
+        for (m in testMemories) {
+            val v = b.embed(m.toByteArray(utf8))
+            if (v == null) {
+                say("  FAILED to embed a memory. " + b.lastLog().takeLast(300))
+                b.unloadAux()
+                return
+            }
+            memVecs.add(v)
+        }
+        val qVecs = ArrayList<FloatArray>()
+        for (c in testCases) {
+            val v = b.embed(c.query.toByteArray(utf8))
+            if (v == null) {
+                say("  FAILED to embed a question. " + b.lastLog().takeLast(300))
+                b.unloadAux()
+                return
+            }
+            qVecs.add(v)
+        }
+        val nTexts = memVecs.size + qVecs.size
+        val embSec = (System.nanoTime() - t0) / 1e9
+        say("  embedded " + nTexts + " texts in " + "%.1f".format(embSec) + " s (vector size " + memVecs[0].size + ")")
+        b.unloadAux()
+
+        // ---- vector search (top 3 per question)
+        val top = ArrayList<List<Int>>()
+        for (qi in testCases.indices) {
+            top.add(memVecs.indices.sortedByDescending { dot(qVecs[qi], memVecs[it]) }.take(3))
+        }
+
+        // ---- reranker
+        say("Step 3: reranker")
+        t0 = System.nanoTime()
+        rc = b.loadAux(rerPath, LlamaBridge.KIND_RERANKER, threads)
+        if (rc != 0) {
+            say(loadError("reranker", rc, b))
+            return
+        }
+        say("  loaded in " + secs(t0) + " s | " + b.auxInfo())
+
+        t0 = System.nanoTime()
+        var nScores = 0
+        val rerankBest = IntArray(testCases.size)
+        val rerankText = ArrayList<String>()
+        for (qi in testCases.indices) {
+            var best = -1
+            var bestScore = -1e9f
+            val parts = ArrayList<String>()
+            for (mi in top[qi]) {
+                val score = b.rerankScore(
+                    testCases[qi].query.toByteArray(utf8),
+                    testMemories[mi].toByteArray(utf8)
+                )
+                nScores++
+                if (score <= -1e5f) {
+                    say("  FAILED to score a memory. " + b.lastLog().takeLast(300))
+                    b.unloadAux()
+                    return
+                }
+                parts.add("" + (mi + 1) + " (" + "%.2f".format(score) + ")")
+                if (score > bestScore) {
+                    bestScore = score
+                    best = mi
+                }
+            }
+            rerankBest[qi] = best
+            rerankText.add(parts.joinToString(", "))
+        }
+        val rerSec = (System.nanoTime() - t0) / 1e9
+        say("  scored " + nScores + " pairs in " + "%.1f".format(rerSec) + " s")
+        b.unloadAux()
+
+        // ---- results
+        say("")
+        say("Memories:")
+        for (i in testMemories.indices) say("  " + (i + 1) + ") " + testMemories[i])
+        say("")
+
+        var vectorOk = 0
+        var rerankOk = 0
+        for (qi in testCases.indices) {
+            val c = testCases[qi]
+            val vecTop = top[qi][0]
+            val vecRight = vecTop == c.answer
+            val rerRight = rerankBest[qi] == c.answer
+            if (vecRight) vectorOk++
+            if (rerRight) rerankOk++
+            say("Question " + (qi + 1) + ": " + c.query)
+            say("  right answer: memory " + (c.answer + 1))
+            say("  vector search top 3: " + top[qi].joinToString(", ") { "" + (it + 1) } +
+                (if (vecRight) "  -> OK" else "  -> WRONG"))
+            say("  reranker scores: " + rerankText[qi] + "  -> best " + (rerankBest[qi] + 1) +
+                (if (rerRight) "  OK" else "  WRONG"))
+        }
+        say("")
+        say("Vector search alone: " + vectorOk + "/" + testCases.size)
+        say("Vector search + reranker: " + rerankOk + "/" + testCases.size)
+        say("Speed: embedding " + "%.0f".format(embSec * 1000 / nTexts) + " ms per text, reranking " +
+            "%.0f".format(rerSec * 1000 / nScores) + " ms per pair")
+        if (rerankOk == testCases.size) {
+            say("RESULT: PASS. The backend works.")
+        } else {
+            say("RESULT: not perfect. Send this whole text to Claude.")
         }
     }
 
