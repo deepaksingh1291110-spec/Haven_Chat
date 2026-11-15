@@ -61,6 +61,7 @@ class MainActivity : Activity() {
     private lateinit var rerankPathEdit: EditText
     private lateinit var selfTestBtn: Button
     private lateinit var dbTestBtn: Button
+    private lateinit var searchTestBtn: Button
     private lateinit var panelHolder: ScrollView
     private lateinit var infoText: TextView
     private lateinit var scroll: ScrollView
@@ -248,6 +249,11 @@ class MainActivity : Activity() {
         dbTestBtn.text = "Database self-test"
         panel.addView(dbTestBtn)
 
+        searchTestBtn = Button(this)
+        searchTestBtn.isAllCaps = false
+        searchTestBtn.text = "Search pipeline test (unloads Gemma)"
+        panel.addView(searchTestBtn)
+
         infoText = TextView(this)
         infoText.textSize = 11f
         panel.addView(infoText)
@@ -301,6 +307,7 @@ class MainActivity : Activity() {
         newChatBtn.setOnClickListener { onNewChatClicked() }
         selfTestBtn.setOnClickListener { onSelfTestClicked() }
         dbTestBtn.setOnClickListener { onDbTestClicked() }
+        searchTestBtn.setOnClickListener { onSearchTestClicked() }
         sendBtn.setOnClickListener { onSendClicked() }
         stopBtn.setOnClickListener { bridge?.stop() }
 
@@ -344,6 +351,7 @@ class MainActivity : Activity() {
         newChatBtn.isEnabled = !b
         selfTestBtn.isEnabled = !b
         dbTestBtn.isEnabled = !b
+        searchTestBtn.isEnabled = !b
         sendBtn.isEnabled = !b
         stopBtn.isEnabled = b
     }
@@ -723,6 +731,66 @@ class MainActivity : Activity() {
         }
     }
 
+    // ------------------------------------------------------------------ search pipeline test
+
+    /** Real models, real pipeline, a separate test database. Gemma is unloaded first (RAM). */
+    private fun onSearchTestClicked() {
+        if (busy) return
+        if (!engineReady) {
+            toast("The engine is not ready yet")
+            return
+        }
+        if (!hasAllFilesAccess()) {
+            toast("Tap 'Allow file access' first")
+            return
+        }
+        val embPath = embedPathEdit.text.toString().trim()
+        val rerPath = rerankPathEdit.text.toString().trim()
+        if (!File(embPath).isFile) {
+            statusText.text = "File not found: $embPath"
+            return
+        }
+        if (!File(rerPath).isFile) {
+            statusText.text = "File not found: $rerPath"
+            return
+        }
+        val threads = threadsSpinner.selectedItemPosition + 1
+
+        loaded = false          // Gemma is unloaded by the test
+        setBusy(true)
+        panelHolder.visibility = View.GONE
+        updateToggleText()
+        statusText.text = "Search pipeline test running..."
+        appendOutput("\n\n")
+        say("=== Search pipeline test ($threads threads) ===")
+
+        worker.execute {
+            val b = bridge
+            var ok = false
+            try {
+                if (b == null) {
+                    say("The engine is not available.")
+                } else {
+                    say("Unloading Gemma (RAM)...")
+                    b.unload()
+                    val testPath = (File(HavenDb.DEFAULT_PATH).parent ?: "") + "/searchtest.db"
+                    ok = SearchPipelineTest(BridgeSearchModels(b)) { line -> say(line) }
+                        .run(testPath, embPath, rerPath, threads)
+                }
+            } catch (e: SearchException) {
+                say("SEARCH FAILED: " + e.message)
+            } catch (t: Throwable) {
+                say("Search test crashed: " + t.javaClass.simpleName + " " + t.message)
+            }
+            try { b?.unloadAux() } catch (t: Throwable) { }
+            runOnUiThread {
+                statusText.text = (if (ok) "Search pipeline test passed" else "Search pipeline test finished") +
+                    ". Press Load model to chat again."
+                setBusy(false)
+            }
+        }
+    }
+
     private fun onSendClicked() {
         if (busy) return
         if (!loaded) {
@@ -987,11 +1055,12 @@ class DatabaseSelfTest(private val say: (String) -> Unit) {
         val c1 = chats.createChat()
         check("new chat has the default title", chats.getChat(c1)?.title == ChatStore.DEFAULT_TITLE)
         chats.addMessage(c1, "user", "Can you tell me about my previous ai project")
+        val expectedTitle = ChatStore.titleFrom("Can you tell me about my previous ai project")
         check("first message becomes the title",
-            chats.getChat(c1)?.title == "Can you tell me about my previous ai", chats.getChat(c1)?.title ?: "null")
+            chats.getChat(c1)?.title == expectedTitle, chats.getChat(c1)?.title ?: "null")
         chats.addMessage(c1, "assistant", "You are building a private AI with long-term memory.", "Thinking: look in memory")
         chats.addMessage(c1, "user", "Thanks")
-        check("title is set only once", chats.getChat(c1)?.title == "Can you tell me about my previous ai")
+        check("title is set only once", chats.getChat(c1)?.title == expectedTitle)
         val msgs = chats.messages(c1)
         check("3 messages in order, thinking kept apart",
             msgs.map { it.role } == listOf("user", "assistant", "user") &&
@@ -1025,5 +1094,128 @@ class DatabaseSelfTest(private val say: (String) -> Unit) {
         say("RESULT: " + passed + " of " + (passed + failed) + " checks passed")
         say(if (failed == 0) "The database works." else "Some checks failed: send me this screen.")
         return failed == 0
+    }
+}
+
+/**
+ * Search pipeline test with the REAL embedder and reranker.
+ * 23 made-up memories go into a separate test file (deleted afterwards). Six questions are
+ * asked in different words; each should find its own memory. Times are shown for every step.
+ */
+class SearchPipelineTest(
+    private val models: SearchModels,
+    private val say: (String) -> Unit
+) {
+
+    private class Item(val question: String, val answer: String, val tags: List<String>)
+    private class Case(val question: String, val expected: Int)
+
+    private val items = listOf(
+        // 0-5: the memories the questions should find
+        Item("How did I fix the timing error in my counter project?",
+            "Added a pull-down resistor on the clear pin of the 74HC161 counter IC. That fixed the clock skew.",
+            listOf("74hc161", "counter", "clock skew", "resistor")),
+        Item("Which tools do we use to build the phone app?",
+            "Decided: Kotlin app, llama.cpp for the models, CPU only, and GitHub Actions to build the APK.",
+            listOf("android", "kotlin", "llama.cpp", "github actions")),
+        Item("How fast is Gemma on my phone?",
+            "My phone is a Realme P3 with 8 GB RAM. Gemma 4 E2B runs at about 7 tokens per second on the CPU.",
+            listOf("gemma", "speed", "realme p3", "tokens per second")),
+        Item("Trip planning",
+            "Planning a trip to Jaipur in December. Booked the train tickets and a small hotel near the old city.",
+            listOf("travel", "jaipur", "train", "hotel")),
+        Item("Why did my C++ program crash?",
+            "Started learning pointers. The segmentation fault came from using a pointer after the memory was freed.",
+            listOf("c++", "pointer", "segmentation fault")),
+        Item("Which models find my old memories?",
+            "Chose bge-m3 as the embedder and bge-reranker-v2-m3 as the reranker. Both passed the 5 out of 5 retrieval test.",
+            listOf("bge-m3", "reranker", "retrieval", "embedder")),
+        // 6-22: other notes that look a little similar (to make the search work)
+        Item("Python practice", "Learning Python decorators and list comprehensions this week.", listOf("python", "learning")),
+        Item("Electronics", "Bought a second-hand multimeter to check circuits on the breadboard.", listOf("multimeter", "breadboard")),
+        Item("Phone battery", "The battery of my phone drains fast when the screen stays on.", listOf("battery", "phone")),
+        Item("Cooking", "Recipe for dal tadka: boil lentils, then fry cumin, garlic and chilli.", listOf("recipe", "dal")),
+        Item("Reading", "Reading a book about operating systems, chapter on virtual memory and paging.", listOf("book", "operating systems")),
+        Item("Goa photos", "The beach holiday photos from Goa need to be sorted and backed up.", listOf("photos", "goa")),
+        Item("Termux git", "Set up git on Termux and pushed the first commit to the repository.", listOf("termux", "git")),
+        Item("Gemma output", "Gemma writes thinking text before the answer; the screen shows it in grey.", listOf("gemma", "thinking")),
+        Item("Math homework", "Derivative of sin x times x squared, then the integral of x times e to the x.", listOf("math", "homework")),
+        Item("Daily plan", "Wake up at six, walk thirty minutes, study C++ for two hours.", listOf("plan", "study")),
+        Item("Shopping", "Need to buy a USB-C cable and a power bank.", listOf("shopping", "cable")),
+        Item("Memory database", "The SQLite database stores raw questions and answers with tags.", listOf("sqlite", "database")),
+        Item("Space", "Watched a documentary about space telescopes and dark matter.", listOf("space", "documentary")),
+        Item("Monitor", "The monitor flickers when the HDMI cable is loose.", listOf("monitor", "hdmi")),
+        Item("Chess", "Practising chess openings: the Italian game and the Queen's gambit.", listOf("chess")),
+        Item("Plants", "Water the plants twice a week and clean the balcony.", listOf("plants", "home")),
+        Item("Family call", "Called mom on Sunday; she asked about the exam results.", listOf("family", "call"))
+    )
+
+    private val cases = listOf(
+        Case("How did I solve the timing problem in my digital logic counter?", 0),
+        Case("Which tools did we pick for building the phone app?", 1),
+        Case("How fast is the language model on my handset?", 2),
+        Case("What are my travel arrangements for winter?", 3),
+        Case("Why did my program crash when I used a dangling pointer?", 4),
+        Case("Which neural networks do I use for searching past notes?", 5)
+    )
+
+    private fun secs(t0: Long): String = "%.1f".format((System.nanoTime() - t0) / 1e9)
+
+    private fun deleteFiles(path: String) {
+        for (suffix in listOf("", "-journal", "-wal", "-shm")) File(path + suffix).delete()
+    }
+
+    /** Returns true when every question finds its own memory in the best 3. */
+    fun run(dbPath: String, embPath: String, rerPath: String, threads: Int): Boolean {
+        deleteFiles(dbPath)
+        val h = HavenDb.open(dbPath)
+        try {
+            val store = MemoryStore(h)
+            val ids = items.map { store.add(it.question, it.answer, it.tags) }
+            say("Saved " + ids.size + " test memories in a separate file.")
+            say("Candidates per search: " + Retrieval.DEFAULT_VECTOR_CANDIDATES + " by vector + " +
+                Retrieval.DEFAULT_KEYWORD_CANDIDATES + " by keyword.")
+            say("")
+
+            val retrieval = Retrieval(models, store, embPath, rerPath, threads) { say("   " + it) }
+
+            say("1) Embedding all memories (bge-m3)...")
+            var t0 = System.nanoTime()
+            val n = retrieval.embedPending()
+            say("   " + n + " memories in " + secs(t0) + " s")
+            say("")
+
+            say("2) Searching (embedder + reranker are loaded for every search)...")
+            var top1 = 0
+            var top3 = 0
+            val searchStart = System.nanoTime()
+            for ((i, c) in cases.withIndex()) {
+                say("")
+                say("Q" + (i + 1) + ": " + c.question)
+                t0 = System.nanoTime()
+                val hits = retrieval.search(c.question)
+                val took = secs(t0)
+                val expectedId = ids[c.expected]
+                for ((rank, hit) in hits.withIndex()) {
+                    say("   " + (rank + 1) + ". score " + "%.2f".format(hit.score) + "  " +
+                        hit.question.take(45) + (if (hit.id == expectedId) "   <-- right" else ""))
+                }
+                val first = hits.firstOrNull()?.id == expectedId
+                val inThree = hits.any { it.id == expectedId }
+                if (first) top1++
+                if (inThree) top3++
+                say("   " + (if (first) "OK (first)" else if (inThree) "OK (in the best 3, not first)" else "WRONG") +
+                    " | search time " + took + " s")
+            }
+            say("")
+            say("RESULT: right memory first " + top1 + "/" + cases.size +
+                " | in the best 3: " + top3 + "/" + cases.size +
+                " | average search time " + "%.1f".format((System.nanoTime() - searchStart) / 1e9 / cases.size) + " s")
+            say(if (top3 == cases.size) "The search pipeline works." else "Some answers are wrong: send me this screen.")
+            return top3 == cases.size
+        } finally {
+            h.close()
+            deleteFiles(dbPath)
+        }
     }
 }
