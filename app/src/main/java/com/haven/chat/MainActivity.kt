@@ -27,6 +27,7 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
+import java.time.LocalDate
 import java.util.concurrent.Executors
 
 /**
@@ -59,6 +60,7 @@ class MainActivity : Activity() {
     private lateinit var embedPathEdit: EditText
     private lateinit var rerankPathEdit: EditText
     private lateinit var selfTestBtn: Button
+    private lateinit var dbTestBtn: Button
     private lateinit var panelHolder: ScrollView
     private lateinit var infoText: TextView
     private lateinit var scroll: ScrollView
@@ -241,6 +243,11 @@ class MainActivity : Activity() {
         selfTestBtn.text = "Search models self-test"
         panel.addView(selfTestBtn)
 
+        dbTestBtn = Button(this)
+        dbTestBtn.isAllCaps = false
+        dbTestBtn.text = "Database self-test"
+        panel.addView(dbTestBtn)
+
         infoText = TextView(this)
         infoText.textSize = 11f
         panel.addView(infoText)
@@ -293,6 +300,7 @@ class MainActivity : Activity() {
         loadBtn.setOnClickListener { onLoadClicked() }
         newChatBtn.setOnClickListener { onNewChatClicked() }
         selfTestBtn.setOnClickListener { onSelfTestClicked() }
+        dbTestBtn.setOnClickListener { onDbTestClicked() }
         sendBtn.setOnClickListener { onSendClicked() }
         stopBtn.setOnClickListener { bridge?.stop() }
 
@@ -335,6 +343,7 @@ class MainActivity : Activity() {
         loadBtn.isEnabled = !b
         newChatBtn.isEnabled = !b
         selfTestBtn.isEnabled = !b
+        dbTestBtn.isEnabled = !b
         sendBtn.isEnabled = !b
         stopBtn.isEnabled = b
     }
@@ -683,6 +692,37 @@ class MainActivity : Activity() {
         statusText.text = "New chat started"
     }
 
+    // ------------------------------------------------------------------ database self-test
+
+    /** Tests the database with a separate test file; your real memory.db is only opened, never changed. */
+    private fun onDbTestClicked() {
+        if (busy) return
+        if (!hasAllFilesAccess()) {
+            toast("Tap 'Allow file access' first")
+            return
+        }
+        setBusy(true)
+        panelHolder.visibility = View.GONE
+        updateToggleText()
+        statusText.text = "Database self-test running..."
+        appendOutput("\n\n")
+        say("=== Database self-test ===")
+
+        worker.execute {
+            var ok = false
+            try {
+                val testPath = (File(HavenDb.DEFAULT_PATH).parent ?: "") + "/selftest.db"
+                ok = DatabaseSelfTest { line -> say(line) }.run(HavenDb.DEFAULT_PATH, testPath)
+            } catch (t: Throwable) {
+                say("Database self-test crashed: " + t.javaClass.simpleName + " " + t.message)
+            }
+            runOnUiThread {
+                statusText.text = if (ok) "Database self-test passed" else "Database self-test: problems found"
+                setBusy(false)
+            }
+        }
+    }
+
     private fun onSendClicked() {
         if (busy) return
         if (!loaded) {
@@ -836,5 +876,154 @@ class ThinkingSplitter(
             buf = StringBuilder(text.substring(n))
             return
         }
+    }
+}
+
+/**
+ * Database self-test. Runs on a background thread.
+ * It uses a separate test file (selftest.db) that is deleted afterwards, so your real
+ * memory.db is never changed. Vectors are small made-up ones (no model needed).
+ */
+class DatabaseSelfTest(private val say: (String) -> Unit) {
+
+    private var passed = 0
+    private var failed = 0
+
+    private fun check(name: String, ok: Boolean, detail: String = "") {
+        if (ok) {
+            passed++
+            say("  OK    $name")
+        } else {
+            failed++
+            say("  FAIL  $name" + (if (detail.isNotEmpty()) "  ($detail)" else ""))
+        }
+    }
+
+    private fun deleteFiles(path: String) {
+        for (suffix in listOf("", "-journal", "-wal", "-shm")) File(path + suffix).delete()
+    }
+
+    private fun vec(vararg x: Float): FloatArray = x
+
+    /** Returns true when every check passed. */
+    fun run(realPath: String, testPath: String): Boolean {
+        // ---- 1) the real database: only opened (this also creates it the first time)
+        say("1) Opening your real database (nothing is changed)...")
+        val real = HavenDb.open(realPath)
+        say("   " + real.info())
+        real.close()
+
+        // ---- 2) a clean test database
+        deleteFiles(testPath)
+        var h = HavenDb.open(testPath)
+        say("2) Test database created. Keyword index: " +
+            (if (h.hasFts) "FTS5 (fast)" else "not available, slower word matching is used"))
+        var mem = MemoryStore(h)
+        var chats = ChatStore(h)
+
+        // ---- 3) memories
+        say("3) Memories")
+        val ids = ArrayList<Long>()
+        ids.add(mem.add("How did I fix the timing error in my counter project?",
+            "Added a pull-down resistor on the clear pin of the 74HC161 counter IC.",
+            listOf("74hc161", "counter", "clock skew")))
+        ids.add(mem.add("Which tools do we use to build the phone app?",
+            "Kotlin, llama.cpp and GitHub Actions. CPU only.", listOf("android", "kotlin", "github")))
+        ids.add(mem.add("How fast is Gemma on my phone?",
+            "About 7 tokens per second on the CPU of the Realme P3.", listOf("gemma", "speed", "realme")))
+        ids.add(mem.add("Trip planning",
+            "Booked train tickets to Jaipur for December.", listOf("travel", "jaipur")))
+        ids.add(mem.add("C++ pointers",
+            "The crash came from using a pointer after it was freed.", listOf("c++", "pointer", "segfault")))
+        check("5 memories saved", mem.count() == 5 && ids.toSet().size == 5, "count " + mem.count())
+
+        val again = mem.add("Trip planning", "Booked train tickets to Jaipur for December.", listOf("travel"))
+        check("same memory is not saved twice", again == ids[3] && mem.count() == 5)
+
+        val tagsBack = mem.getRows(listOf(ids[0])).firstOrNull()?.tags
+        check("tags are stored tidy", tagsBack == "74hc161 counter clock skew", tagsBack ?: "null")
+
+        check("keyword search finds the counter memory",
+            mem.hitIds(listOf("counter resistor")) == listOf(ids[0]), mem.hitIds(listOf("counter resistor")).toString())
+        check("keyword search works from the start of a word (point = pointer)",
+            mem.hitIds(listOf("point")) == listOf(ids[4]), mem.hitIds(listOf("point")).toString())
+        check("quick count is 0 when nothing matches", mem.quickCount(listOf("zebra giraffe")) == 0)
+        check("filler words only: no search", mem.hitIds(listOf("the and")).isEmpty())
+
+        // time filter: make the Jaipur memory 200 days old
+        val old = LocalDate.now().minusDays(200).toString()
+        h.db.execSQL("UPDATE memories SET event_date = ? WHERE id = ?", arrayOf<Any?>(old, ids[3]))
+        check("time filter last_month hides an old memory", mem.hitIds(listOf("jaipur"), "last_month").isEmpty())
+        check("time filter last_year and no filter find it",
+            mem.hitIds(listOf("jaipur"), "last_year") == listOf(ids[3]) &&
+                mem.hitIds(listOf("jaipur"), null) == listOf(ids[3]))
+
+        // ---- 4) vectors (made-up 8-number vectors, one per memory)
+        say("4) Vectors")
+        check("all 5 memories wait for a vector", mem.pendingCount() == 5 && mem.pending().size == 5)
+        val vectors = ids.indices.map { i -> FloatArray(8) { j -> if (j == i) 1f else 0f } }
+        mem.setVecs(ids.indices.map { Pair(ids[it], vectors[it]) })
+        check("vectors saved", mem.pendingCount() == 0)
+        val roundTrip = bytesToFloats(floatsToBytes(vec(0.5f, -1.25f, 3.0e-5f)))
+        check("vector bytes round trip", roundTrip.contentEquals(vec(0.5f, -1.25f, 3.0e-5f)))
+        val query = vec(0f, 0.2f, 0f, 0.98f, 0f, 0f, 0f, 0f)
+        val near = mem.nearest(query, null, 3)
+        check("nearest vector is the right memory", near.firstOrNull() == ids[3] && near.size == 3, near.toString())
+        check("a vector of the wrong size is skipped", mem.nearest(vec(1f, 0f, 0f), null, 3).isEmpty())
+
+        // ---- 5) reading and deleting
+        say("5) Reading and deleting")
+        check("rows come back in the order asked",
+            mem.getRows(listOf(ids[2], ids[0])).map { it.id } == listOf(ids[2], ids[0]))
+        check("a missing id is skipped", mem.getRows(listOf(ids[0], 999999L)).size == 1)
+        val recent = mem.recent(2)
+        check("newest memory comes first", recent.size == 2 && recent[0].id == ids[4], recent.map { it.id }.toString())
+        mem.delete(ids[1])
+        check("delete removes the memory and its keyword entry",
+            mem.count() == 4 && mem.hitIds(listOf("kotlin")).isEmpty())
+
+        // ---- 6) chats
+        say("6) Chats")
+        val c1 = chats.createChat()
+        check("new chat has the default title", chats.getChat(c1)?.title == ChatStore.DEFAULT_TITLE)
+        chats.addMessage(c1, "user", "Can you tell me about my previous ai project")
+        check("first message becomes the title",
+            chats.getChat(c1)?.title == "Can you tell me about my previous ai", chats.getChat(c1)?.title ?: "null")
+        chats.addMessage(c1, "assistant", "You are building a private AI with long-term memory.", "Thinking: look in memory")
+        chats.addMessage(c1, "user", "Thanks")
+        check("title is set only once", chats.getChat(c1)?.title == "Can you tell me about my previous ai")
+        val msgs = chats.messages(c1)
+        check("3 messages in order, thinking kept apart",
+            msgs.map { it.role } == listOf("user", "assistant", "user") &&
+                msgs[1].thinking == "Thinking: look in memory" && msgs[0].thinking == null)
+        check("last message of a chat", chats.lastMessages(c1, 1).firstOrNull()?.content == "Thanks")
+
+        val c2 = chats.createChat()
+        chats.addMessage(c2, "user", "A second chat")
+        check("most recent chat is first in the list", chats.listChats().firstOrNull()?.id == c2,
+            chats.listChats().map { it.id }.toString())
+        chats.renameChat(c1, "My AI chat")
+        check("rename works", chats.getChat(c1)?.title == "My AI chat")
+        chats.deleteChat(c2)
+        check("delete removes the chat and its messages", chats.chatCount() == 1 && chats.messageCount(c2) == 0)
+
+        // ---- 7) data stays on disk: close, open again
+        say("7) Closing and opening the file again")
+        h.close()
+        h = HavenDb.open(testPath)
+        mem = MemoryStore(h)
+        chats = ChatStore(h)
+        check("memories and vectors are still there",
+            mem.count() == 4 && mem.nearest(query, null, 1).firstOrNull() == ids[3])
+        check("chats and messages are still there", chats.chatCount() == 1 && chats.messageCount(c1) == 3)
+        say("   " + h.info())
+
+        h.close()
+        deleteFiles(testPath)
+
+        say("")
+        say("RESULT: " + passed + " of " + (passed + failed) + " checks passed")
+        say(if (failed == 0) "The database works." else "Some checks failed: send me this screen.")
+        return failed == 0
     }
 }
